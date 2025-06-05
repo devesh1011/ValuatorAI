@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-llm = GoogleGenAI(model="gemini-2.0-flash-lite", api_key=os.getenv("GOOGLE_API_KEY"))
+llm = GoogleGenAI(model="gemini-2.0-flash-lite", api_key=os.getenv("GOOGLE_API_KEY"), temperature=0)
 
 
 # --- Custom Python Execution Tool ---
@@ -94,32 +94,29 @@ python_script_executor = FunctionAgent(
 metrics_calculator = FunctionAgent(
     name="MetricsCalculator",
     description="Calculates influencer marketing metrics using provided data and parameters.",
-    system_prompt="""You are an Influencer Marketing Metrics Calculator. This is the final step in the workflow.
+    system_prompt="""You are an Influencer Marketing Metrics Calculator and advisor. This is the final step in the workflow.
     1. Extract the median view count from the previous agent's response.
     2. Extract the target CPM from the original user request (e.g., "25 EUR").
     3. Generate Python code to calculate the recommended price using the formula: (Target CPM / 1000) * Median Views.
     4. Use the 'python_code_executor' tool to execute the calculation.
-    5. CRITICAL: After the tool execution, you MUST copy the exact JSON output from the tool and include it in your response text.
+    5. After getting the calculation results, provide a natural language response explaining the recommendation.
     
-    Your response should start with "FINAL RESULT:" followed by the complete JSON from the tool execution.
+    Your response should be conversational and informative, explaining:
+    - The recommended price for the influencer collaboration
+    - The basis for this calculation (median views and target CPM)
+    - A brief summary of the key metrics
     
-    Example Python code:
+    Example Python code for calculation:
     ```python
-    import json
     median_views = [extracted_number]
     target_cpm = 25
     price = (target_cpm / 1000) * median_views
-    result = {
-        "recommended_price": round(price, 2),
-        "median_views": median_views,
-        "target_cpm": target_cpm,
-        "currency": "EUR",
-        "channel_name": "Matthew Berman"
-    }
-    print(json.dumps(result, indent=2))
+    print(f"Recommended Price: {round(price, 2)}")
+    print(f"Median Views: {median_views}")
+    print(f"Target CPM: {target_cpm}")
     ```
     
-    IMPORTANT: Whatever the tool outputs, include that exact output in your response.""",
+    After executing the calculation, format your response like a professional marketing consultant providing advice to a client.""",
     llm=llm,
     tools=[python_tool],
 )
@@ -144,15 +141,8 @@ async def main():
 
         # Get the final result
         response = await handler
-        print("\n--- Workflow Final Output ---")
-        print(f"Response type: {type(response)}")
-
-        # Handle different response types
-        print(f"Response attributes: {dir(response)}")
 
         if hasattr(response, "response"):
-            print(f"Response.response type: {type(response.response)}")
-            print(f"Response.response: {response.response}")
             if hasattr(response.response, "content"):
                 final_content = response.response.content
             else:
@@ -163,25 +153,6 @@ async def main():
             final_content = str(response)
 
         print(f"Final content: {final_content}")
-
-        # Also check if there are any tool outputs
-        if hasattr(response, "tool_calls"):
-            print(f"Tool calls: {response.tool_calls}")
-        if hasattr(response, "sources"):
-            print(f"Sources: {response.sources}")
-
-        # Try to parse as JSON if it looks like JSON
-        if final_content and (
-            final_content.strip().startswith("{")
-            or final_content.strip().startswith("[")
-        ):
-            try:
-                final_json = json.loads(final_content)
-                print("\nParsed JSON Output:")
-                print(json.dumps(final_json, indent=2))
-            except json.JSONDecodeError as e:
-                print(f"(Could not parse as JSON: {e})")
-
     except Exception as e:
         print(f"\n--- An error occurred during workflow execution ---")
         print(f"Error: {e}")
