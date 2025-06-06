@@ -1,19 +1,93 @@
 from typing import Annotated, List, Dict
-from .helper.helpers import _resolve_channel_id, _fetch_video_statistics
+from .helper.helpers import (
+    _resolve_channel_id,
+    _fetch_video_statistics,
+    _fetch_video_details,
+    _search_youtube_channel_videos,
+    _fetch_channel_info,
+    _fetch_videos,
+    _fetch_comments,
+    _introspect_channel,
+    _search_youtube_channels,
+    _search_and_introspect_channel,
+)
+from llama_index.core.tools import FunctionTool
+
+
+def fetch_video_details(video_id: str) -> Dict:
+    """
+    Fetch detailed information about a specific video.
+
+    Args:
+        video_id (str): The YouTube video ID
+
+    Returns:
+        Dict: Video information including:
+            - id: Video ID
+            - title: Video title
+            - description: Video description
+            - publishedAt: Publication date
+            - viewCount: Number of views
+            - likeCount: Number of likes
+            - commentCount: Number of comments
+            - duration: Video duration
+            - thumbnails: Video thumbnails
+    """
+    return _fetch_video_details(video_id)
+
+
+def search_youtube_channel_videos(
+    channel_id: str,
+    search_term: str,
+    max_results: int = 10,
+) -> List[Dict]:
+    """
+    Search for videos within a specific channel that match the search term.
+
+    Args:
+        channel_id (str): The YouTube channel ID
+        search_term (str): The term to search for in video titles and descriptions
+        max_results (int): Maximum number of videos to return (default: 10)
+
+    Returns:
+        List[Dict]: List of video information including:
+            - id: Video ID
+            - title: Video title
+            - description: Video description
+            - publishedAt: Publication date
+            - viewCount: Number of views
+            - likeCount: Number of likes
+            - commentCount: Number of comments
+            - duration: Video duration
+            - thumbnails: Video thumbnails
+    """
+    return _search_youtube_channel_videos(channel_id, search_term, max_results)
+
+
+def fetch_channel_info(
+    channel_id: str,
+) -> Dict:
+    """
+    Fetch basic channel information including subscriber count, view count, and video count.
+
+    Args:
+        channel_id (str): The YouTube channel ID
+
+    Returns:
+        Dict: Channel information including:
+            - id: Channel ID
+            - title: Channel title
+            - description: Channel description
+            - subscriberCount: Number of subscribers
+            - viewCount: Total view count
+            - videoCount: Number of videos
+            - thumbnails: Channel thumbnails
+    """
+    return _fetch_channel_info(channel_id)
 
 
 async def resolve_channel_id(
-    channel_identifier: Annotated[
-        str,
-        """
-        The identifier of the YouTube channel, which can be one of the following:
-        - Channel handle (e.g., "@channelname")
-        - Custom URL (e.g., "youtube.com/c/channelname")
-        - Channel ID (e.g., "UC...")
-        The function will resolve this identifier to the YouTube channel ID.
-        Example: For "@channelname", "youtube.com/c/channelname", or "UCxxxxxxx", it will return the resolved channel ID.
-    """,
-    ],
+    channel_identifier: str,
 ) -> str:
     """
     Resolve a YouTube channel handle, custom URL, or channel ID to a channel ID.
@@ -33,44 +107,11 @@ async def resolve_channel_id(
     return await _resolve_channel_id(channel_identifier)
 
 
-# import asyncio
-
-# response = asyncio.run(resolve_channel_id("Matthew Berman"))
-# print(response)
-
-
 async def fetch_video_statistics(
-    channel_id: Annotated[
-        str,
-        """
-        The unique identifier of the YouTube channel.
-        This is the part of the YouTube URL after '/channel/'. For example:
-        - For the URL 'https://www.youtube.com/channel/UCxxxxxxx', the `channel_id` would be 'UCxxxxxxx'.
-        - This can also be the channel ID directly (e.g., 'UC1234567890').
-    """,
-    ],
-    max_results: Annotated[
-        int,
-        """
-        The maximum number of videos to fetch statistics for.
-        This value controls how many recent videos will be analyzed.
-        Default is 10, but can be set to any integer value.
-    """,
-    ] = 10,
-    months: Annotated[
-        int,
-        """
-        Only include videos published within this number of months.
-        Default is 6 months.
-    """,
-    ] = 6,
-    min_duration_minutes: Annotated[
-        int,
-        """
-        Only include videos that are at least this many minutes long.
-        Default is 3 minutes.
-    """,
-    ] = 3,
+    channel_id: str,
+    max_results: int = 10,
+    months: int = 6,
+    min_duration_minutes: int = 3,
 ) -> List[Dict]:
     """
     Fetch statistics for recent videos on a channel.
@@ -94,3 +135,98 @@ async def fetch_video_statistics(
     return await _fetch_video_statistics(
         channel_id, max_results, months, min_duration_minutes
     )
+
+
+def fetch_videos(
+    channel_id: str,
+    max_results: int = 10,
+) -> List[Dict]:
+    """
+    Fetch recent videos from a channel.
+
+    Args:
+        channel_id (str): The YouTube channel ID
+        max_results (int): Maximum number of videos to fetch (default: 10)
+
+    Returns:
+        List[Dict]: List of video information including:
+            - id: Video ID
+            - title: Video title
+            - description: Video description
+            - publishedAt: Publication date
+            - viewCount: Number of views
+            - likeCount: Number of likes
+            - commentCount: Number of comments
+            - duration: Video duration
+            - thumbnails: Video thumbnails
+    """
+    return _fetch_videos(channel_id, max_results)
+
+
+def fetch_comments(
+    video_id: str,
+    max_results: int = 100,
+) -> List[Dict]:
+    """
+    Fetch comments for a video.
+
+    Args:
+        video_id (str): The YouTube video ID
+        max_results (int): Maximum number of comments to fetch (default: 100)
+
+    Returns:
+        List[Dict]: List of comment information including:
+            - id: Comment ID
+            - author: Author name
+            - text: Comment text
+            - likeCount: Number of likes
+            - publishedAt: Publication date
+    """
+    return _fetch_comments(video_id, max_results)
+
+
+def introspect_channel(
+    identifier: str,
+    max_videos: int = 10,
+) -> Dict:
+    """
+    Resolve the identifier to a channel ID, fetch channel info and recent videos.
+    """
+    return _introspect_channel(identifier, max_videos)
+
+
+def search_youtube_channels(
+    query: str,
+    max_results: int = 5,
+) -> List[Dict]:
+    """
+    Search YouTube for channels related to the query.
+    Returns a list of channel summaries including ID, title, description, and thumbnail.
+    """
+    return _search_youtube_channels(query, max_results)
+
+
+def search_and_introspect_channel(
+    query: str,
+    video_count: int = 5,
+) -> Dict:
+    """
+    Searches for YouTube channels by query, then fetches full info and videos for the top result.
+    """
+    return _search_and_introspect_channel(query, video_count)
+
+
+fetch_video_details_tool = FunctionTool.from_defaults(fetch_video_details)
+search_youtube_channel_videos_tool = FunctionTool.from_defaults(
+    search_youtube_channel_videos
+)
+fetch_channel_info_tool = FunctionTool.from_defaults(fetch_channel_info)
+resolve_channel_id_tool = FunctionTool.from_defaults(resolve_channel_id)
+fetch_video_statistics_tool = FunctionTool.from_defaults(fetch_video_statistics)
+fetch_videos_tool = FunctionTool.from_defaults(fetch_videos)
+fetch_comments_tool = FunctionTool.from_defaults(fetch_comments)
+introspect_channel_tool = FunctionTool.from_defaults(introspect_channel)
+search_youtube_channels_tool = FunctionTool.from_defaults(search_youtube_channels)
+search_and_introspect_channel_tool = FunctionTool.from_defaults(
+    search_and_introspect_channel
+)
