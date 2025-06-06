@@ -1,11 +1,155 @@
-import re
-import os
+from llama_index.core.agent.workflow import FunctionAgent
+from llama_index.llms.google_genai import GoogleGenAI
+from typing import Dict, List, Union, Tuple, Literal
+from firecrawl import FirecrawlApp, ScrapeOptions
+from transformers import CLIPProcessor, CLIPModel
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from typing import List, Dict
 from dotenv import load_dotenv
+import numpy as np
+from scipy import stats
+from textblob import TextBlob
+from io import BytesIO
+from PIL import Image
+import logging
+import requests
+import torch
+
+import re
+import os
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize CLIP model and processor globally
+CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
+logger.info(f"Loading CLIP model {CLIP_MODEL_NAME}…")
+model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
+processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+
+# Global parameters for thumbnail analysis
+TEMPERATURE = 0.07
+SCALE = 5.0
+
+# Prompts covering design, clarity, emotion, composition
+POSITIVE_PROMPTS = [
+    "eye-catching thumbnail",
+    "bold, vibrant colors",
+    "clear, readable text",
+    "prominent faces",
+    "professional design",
+]
+NEGATIVE_PROMPTS = [
+    "blurry or out of focus",
+    "dark or underexposed",
+    "dull colors",
+    "small or unreadable text",
+    "cluttered layout",
+]
+
+
+def _download_image(url: str) -> Image.Image:
+    resp = requests.get(url, timeout=5)
+    resp.raise_for_status()
+    return Image.open(BytesIO(resp.content)).convert("RGB")
+
+
+def _sentiment_score(texts: Union[str, List[str]]) -> float:
+    """
+    Calculate the average sentiment score for a single text or a list of texts using TextBlob.
+    The sentiment score ranges from -1.0 (most negative) to 1.0 (most positive).
+    """
+    # Normalize input to list
+    if isinstance(texts, str):
+        texts = [texts]
+    if not texts:
+        raise ValueError("Input text or list of texts cannot be empty")
+
+    # Calculate sentiment polarity for each text
+    sentiments = [TextBlob(text).sentiment.polarity for text in texts]
+
+    # Compute and return the mean sentiment score
+    return float(np.mean(sentiments))
+
+
+def _score_thumbnail(thumbnail_url: str) -> float:
+    """
+    Compute a 0–1 score for how "attractive" a thumbnail is.
+    """
+    try:
+        logger.info(f"Scoring thumbnail: {thumbnail_url}")
+        img = _download_image(thumbnail_url)
+
+        texts = POSITIVE_PROMPTS + NEGATIVE_PROMPTS
+        inputs = processor(images=img, text=texts, return_tensors="pt", padding=True)
+
+        # Get and normalize features
+        img_feats = model.get_image_features(inputs["pixel_values"])
+        txt_feats = model.get_text_features(inputs["input_ids"])
+        img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
+        txt_feats = txt_feats / txt_feats.norm(dim=-1, keepdim=True)
+
+        # similarity logits
+        logits = (img_feats @ txt_feats.T) / TEMPERATURE  # shape (1, N_prompts)
+        logits = logits.squeeze(0)  # shape (N_prompts,)
+
+        # Debug: log a few values
+        for p, score in zip(texts, logits.tolist()):
+            logger.debug(f"  '{p}': {score:.3f}")
+
+        n_pos = len(POSITIVE_PROMPTS)
+        pos_mean = logits[:n_pos].mean()
+        neg_mean = logits[n_pos:].mean()
+        diff = pos_mean - neg_mean
+
+        # sigmoid normalization
+        score = torch.sigmoid(diff * SCALE).item()
+        logger.info(f"Thumbnail score → {score:.4f}")
+        return float(score)
+
+    except Exception as e:
+        logger.error(f"Failed to score thumbnail: {e}")
+        raise Exception(f"Failed to score thumbnail: {str(e)}")
+
+
+def _predict_next_video_views(
+    historical_views: List[int],
+    confidence_level: float = 0.90,
+    interval_type: Literal["lower", "upper", "two-sided"] = "two-sided",
+) -> Tuple[float, float]:
+    """
+    Predict a one‑ or two‑sided confidence interval for the next video's view count,
+    assuming a log‑normal model.
+    """
+    if not historical_views:
+        raise ValueError("Historical views list cannot be empty")
+    views = np.array(historical_views, dtype=float)
+    if np.any(views <= 0):
+        raise ValueError("All view counts must be positive to fit a log‑normal")
+
+    # Fit a log‑normal: returns (shape, loc, scale)
+    shape, loc, scale = stats.lognorm.fit(views, floc=0)
+
+    alpha = 1.0 - confidence_level
+
+    if interval_type == "lower":
+        # one‑sided lower: find the α‑quantile so P(X ≥ L)=confidence_level
+        L = stats.lognorm.ppf(alpha, shape, loc=loc, scale=scale)
+        return float(L), float("inf")
+
+    elif interval_type == "upper":
+        # one‑sided upper: find the confidence_level‑quantile so P(X ≤ U)=confidence_level
+        U = stats.lognorm.ppf(confidence_level, shape, loc=loc, scale=scale)
+        return float("-inf"), float(U)
+
+    elif interval_type == "two-sided":
+        # central interval: cut off α/2 in each tail
+        lower_q = stats.lognorm.ppf(alpha / 2, shape, loc=loc, scale=scale)
+        upper_q = stats.lognorm.ppf(1 - alpha / 2, shape, loc=loc, scale=scale)
+        return float(lower_q), float(upper_q)
 
 
 class YouTubeAPI:
@@ -59,6 +203,327 @@ async def _resolve_channel_id(channel_identifier: str) -> str:
 
     except HttpError as e:
         raise Exception(f"Error resolving channel ID: {str(e)}")
+
+
+def _fetch_video_details(video_id: str) -> Dict:
+    try:
+        request = youtube_api.youtube.videos().list(
+            part="snippet,statistics,contentDetails", id=video_id
+        )
+        response = request.execute()
+
+        if not response["items"]:
+            raise ValueError(f"Video not found: {video_id}")
+
+        video = response["items"][0]
+        return {
+            "id": video["id"],
+            "title": video["snippet"]["title"],
+            "description": video["snippet"]["description"],
+            "publishedAt": video["snippet"]["publishedAt"],
+            "viewCount": int(video["statistics"]["viewCount"]),
+            "likeCount": int(video["statistics"].get("likeCount", 0)),
+            "commentCount": int(video["statistics"].get("commentCount", 0)),
+            "duration": video["contentDetails"]["duration"],
+            "thumbnails": video["snippet"]["thumbnails"],
+        }
+    except HttpError as e:
+        raise Exception(f"Error fetching video details: {str(e)}")
+
+
+def _search_youtube_channel_videos(
+    channel_id: str, search_term: str, max_results: int = 10
+) -> List[Dict]:
+    try:
+        # Search for videos in the channel
+        request = youtube_api.youtube.search().list(
+            part="snippet",
+            channelId=channel_id,
+            q=search_term,
+            type="video",
+            maxResults=max_results,
+            order="relevance",
+        )
+        response = request.execute()
+
+        if not response["items"]:
+            return []
+
+        # Get detailed information for each video
+        videos = []
+        for item in response["items"]:
+            video_id = item["id"]["videoId"]
+            video_details = _fetch_video_details(video_id)
+            videos.append(video_details)
+
+        return videos
+
+    except HttpError as e:
+        raise Exception(f"Error searching channel videos: {str(e)}")
+
+
+def _fetch_channel_info(channel_id: str) -> Dict:
+    try:
+        request = youtube_api.youtube.channels().list(
+            part="snippet,statistics", id=channel_id
+        )
+        response = request.execute()
+
+        if not response["items"]:
+            raise ValueError(f"Channel not found: {channel_id}")
+
+        channel = response["items"][0]
+        return {
+            "id": channel["id"],
+            "title": channel["snippet"]["title"],
+            "description": channel["snippet"]["description"],
+            "subscriberCount": int(channel["statistics"]["subscriberCount"]),
+            "viewCount": int(channel["statistics"]["viewCount"]),
+            "videoCount": int(channel["statistics"]["videoCount"]),
+            "thumbnails": channel["snippet"]["thumbnails"],
+        }
+    except HttpError as e:
+        raise Exception(f"Error fetching channel info: {str(e)}")
+
+
+def _fetch_channel_info(channel_id: str) -> Dict:
+    try:
+        request = youtube_api.youtube.channels().list(
+            part="snippet,statistics", id=channel_id
+        )
+        response = request.execute()
+
+        if not response["items"]:
+            raise ValueError(f"Channel not found: {channel_id}")
+
+        channel = response["items"][0]
+        return {
+            "id": channel["id"],
+            "title": channel["snippet"]["title"],
+            "description": channel["snippet"]["description"],
+            "subscriberCount": int(channel["statistics"]["subscriberCount"]),
+            "viewCount": int(channel["statistics"]["viewCount"]),
+            "videoCount": int(channel["statistics"]["videoCount"]),
+            "thumbnails": channel["snippet"]["thumbnails"],
+        }
+    except HttpError as e:
+        raise Exception(f"Error fetching channel info: {str(e)}")
+
+
+def _fetch_videos(channel_id: str, max_results: int = 10) -> List[Dict]:
+    try:
+        # First get the uploads playlist ID
+        request = youtube_api.youtube.channels().list(
+            part="contentDetails", id=channel_id
+        )
+        response = request.execute()
+
+        if not response["items"]:
+            raise ValueError(f"Channel not found: {channel_id}")
+
+        uploads_playlist_id = response["items"][0]["contentDetails"][
+            "relatedPlaylists"
+        ]["uploads"]
+
+        # Then get the videos from the uploads playlist
+        request = youtube_api.youtube.playlistItems().list(
+            part="snippet,contentDetails",
+            playlistId=uploads_playlist_id,
+            maxResults=max_results,
+        )
+        response = request.execute()
+
+        videos = []
+        for item in response["items"]:
+            video_id = item["contentDetails"]["videoId"]
+            video_details = _fetch_video_details(video_id)
+            videos.append(video_details)
+
+        return videos
+    except HttpError as e:
+        raise Exception(f"Error fetching videos: {str(e)}")
+
+
+def _fetch_comments(video_id: str, max_results: int = 25) -> List[Dict]:
+    comments: List[Dict] = []
+    next_page_token = None
+
+    try:
+        while len(comments) < max_results:
+            # fetch up to 100 per page (API limit), or however many you still need
+            batch_size = min(100, max_results - len(comments))
+            request = youtube_api.youtube.commentThreads().list(
+                part="snippet",
+                videoId=video_id,
+                maxResults=batch_size,
+                order="time",  # newest first
+                pageToken=next_page_token,
+            )
+            response = request.execute()
+
+            for item in response.get("items", []):
+                top = item.get("snippet", {}).get("topLevelComment", {})
+                snip = top.get("snippet", {})
+
+                # ensure we at least have an ID and text before appending
+                comment_id = top.get("id")
+                text = snip.get("textDisplay")
+                if not comment_id or text is None:
+                    continue
+
+                comments.append(
+                    {
+                        "id": comment_id,
+                        "author": snip.get("authorDisplayName", "Unknown"),
+                        "text": text,
+                        "likeCount": snip.get("likeCount", 0),
+                        "publishedAt": snip.get("publishedAt"),
+                    }
+                )
+
+            # prepare for next page (if any)
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token:
+                break
+
+        return comments
+
+    except HttpError as e:
+        raise Exception(f"Error fetching comments: {e}")
+
+
+def _introspect_channel(identifier: str, max_videos: int = 10) -> Dict:
+    try:
+        # Step 1: Resolve to Channel ID
+        channel_id = _resolve_channel_id(identifier)
+
+        # Step 2: Fetch channel info
+        channel_info = _fetch_channel_info(channel_id)
+
+        # Step 3: Fetch videos
+        recent_videos = _fetch_videos(channel_id, max_videos)
+
+        return {"channel_info": channel_info, "recent_videos": recent_videos}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _search_youtube_channels(
+    query: str, max_results: int = 5, min_subscribers: int = 1000
+) -> List[Dict]:
+    try:
+        # Calculate date for one month ago
+        from datetime import datetime, timedelta
+
+        one_month_ago = (datetime.utcnow() - timedelta(days=30)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        # First, search for videos from the last month
+        request = youtube_api.youtube.search().list(
+            part="snippet",
+            q=query,
+            type="video",
+            maxResults=50,  # Get more results initially to filter
+            order="viewCount",  # Sort by view count
+            publishedAfter=one_month_ago,
+        )
+        response = request.execute()
+
+        # Track unique channels and their best performing video
+        channel_videos = {}  # channel_id -> (video_views, video_data)
+
+        for item in response.get("items", []):
+            video_id = item["id"]["videoId"]
+            channel_id = item["snippet"]["channelId"]
+
+            # Skip if we already have this channel
+            if channel_id in channel_videos:
+                continue
+
+            # Get video statistics
+            video_request = youtube_api.youtube.videos().list(
+                part="statistics", id=video_id
+            )
+            video_response = video_request.execute()
+
+            if not video_response.get("items"):
+                continue
+
+            video_data = video_response["items"][0]
+            view_count = int(video_data["statistics"].get("viewCount", 0))
+
+            # Get channel statistics
+            channel_request = youtube_api.youtube.channels().list(
+                part="statistics,snippet", id=channel_id
+            )
+            channel_response = channel_request.execute()
+
+            if not channel_response.get("items"):
+                continue
+
+            channel_data = channel_response["items"][0]
+            subscriber_count = int(channel_data["statistics"].get("subscriberCount", 0))
+
+            # Only include channels that meet the subscriber threshold
+            if subscriber_count >= min_subscribers:
+                channel_videos[channel_id] = (
+                    view_count,
+                    {
+                        "channelId": channel_id,
+                        "title": channel_data["snippet"]["title"],
+                        "description": channel_data["snippet"]["description"],
+                        "thumbnails": channel_data["snippet"]["thumbnails"],
+                        "subscriberCount": subscriber_count,
+                        "viewCount": int(
+                            channel_data["statistics"].get("viewCount", 0)
+                        ),
+                        "videoCount": int(
+                            channel_data["statistics"].get("videoCount", 0)
+                        ),
+                        "customUrl": channel_data["snippet"].get("customUrl", ""),
+                        "publishedAt": channel_data["snippet"].get("publishedAt", ""),
+                        "bestVideoViews": view_count,  # Add the view count of their best video
+                    },
+                )
+
+        # Convert to list and sort by best video views
+        channels = [data for _, data in channel_videos.values()]
+        channels.sort(key=lambda x: x["subscriberCount"], reverse=True)
+
+        # Return only the requested number of results
+        return channels[:max_results]
+
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+def _search_and_introspect_channel(query: str, video_count: int = 5) -> Dict:
+    try:
+        # Step 1: Search channels
+        search_response = (
+            youtube_api.youtube.search()
+            .list(part="snippet", q=query, type="channel", maxResults=1)
+            .execute()
+        )
+
+        if not search_response["items"]:
+            return {"error": f"No channels found for query: {query}"}
+
+        top_channel = search_response["items"][0]
+        channel_id = top_channel["id"]["channelId"]
+
+        # Step 2: Fetch channel info
+        channel_info = _fetch_channel_info(channel_id)
+
+        # Step 3: Fetch recent videos
+        videos = _fetch_videos(channel_id, max_results=video_count)
+
+        return {"query": query, "channelInfo": channel_info, "recentVideos": videos}
+
+    except Exception as e:
+        return {"error": str(e)}
 
 
 async def _fetch_video_statistics(
@@ -181,3 +646,90 @@ async def _fetch_video_statistics(
         return video_stats
     except HttpError as e:
         raise Exception(f"Error fetching video statistics: {str(e)}")
+
+
+def _crawl_talent_agency(agency_url: str, limit: int = 20) -> Dict:
+    """
+    Crawl a talent agency website to extract information about their talents/influencers.
+
+    Args:
+        agency_url (str): The URL of the talent agency website
+        limit (int): Maximum number of pages to crawl (default: 50)
+
+    Returns:
+        Dict: A dictionary containing:
+            - agency_name: Name of the talent agency
+            - talents: List of talent information including:
+                - name: Talent's name
+                - social_links: Dictionary of social media links
+                - bio: Short biography
+                - categories: List of talent categories
+                - stats: Dictionary of social media statistics
+    """
+    try:
+
+        # Initialize Firecrawl
+        app = FirecrawlApp(api_key=os.getenv("FIRECRAWL_API_KEY"))
+
+        # Configure scraping options
+        scrape_options = ScrapeOptions(
+            formats=["markdown", "html"],
+            onlyMainContent=True,
+            excludeTags=["script", "style", "nav", "footer", "header"],
+        )
+
+        # Crawl the website
+        crawl_result = app.crawl_url(
+            agency_url, limit=limit, scrape_options=scrape_options
+        )
+
+        # Create an agent to parse the crawled content
+        parser_agent = FunctionAgent(
+            name="Talent Parser",
+            description="Parse talent agency website content to extract talent information",
+            model=GoogleGenAI(id="gpt-4.1-mini"),
+            system_prompt="""Extract the following information from the website content:",
+                "1. Agency name",
+                "2. Agency contact information (email, phone, address)",
+                "3. List of talents with:",
+                "   - Name",
+                "   - Social media links (YouTube, Instagram, etc.)",
+                "   - Brief bio (1-2 sentences)",
+                "Return the data in this JSON format:",
+                "{",
+                "  'agency_name': 'string',",
+                "  'agency_contact': {",
+                "    'email': 'string',",
+                "    'phone': 'string',",
+                "    'address': 'string'",
+                "  },",
+                "  'talents': [",
+                "    {",
+                "      'name': 'string',",
+                "      'social_links': {",
+                "        'youtube': 'string',",
+                "        'instagram': 'string',",
+                "        'other': 'string'",
+                "      },",
+                "      'bio': 'string'",
+                "    }",
+                "  ]",
+                "}""",
+        )
+
+        # Parse the crawled content
+        parsed_content = parser_agent.run(user_msg=f"Website content: {crawl_result}")
+
+        try:
+            # Convert string response to dictionary
+            talent_data = eval(parsed_content.content)
+            return talent_data
+        except:
+            # Fallback in case of parsing error
+            return {
+                "error": "Failed to parse talent information",
+                "raw_content": crawl_result,
+            }
+
+    except Exception as e:
+        raise Exception(f"Error crawling talent agency: {str(e)}")
